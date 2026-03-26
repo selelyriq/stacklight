@@ -47,41 +47,129 @@ def c(color, text, use_color=True):
     return f"{color}{text}{RESET}" if use_color else text
 
 # ── Resource impact knowledge base ───────────────────────────────────────────
+# Each entry may include a "detail" dict for replacements/removals:
+#   downtime  — human estimate of service interruption
+#   loses     — list of things that change or are destroyed
+#   rollback  — what CFN does if the deployment fails mid-way
 RESOURCE_KNOWLEDGE = {
     "AWS::RDS::DBInstance": {
         "label": "RDS database instance",
-        "replace": "Your RDS instance will be REPLACED. Expect downtime while the new instance provisions (typically 5–15 min). Existing snapshots are preserved.",
-        "modify": "RDS instance settings updated. Most changes apply at the next maintenance window unless you set ApplyImmediately=true.",
-        "remove": "RDS instance will be DELETED. Data is lost unless a final snapshot is taken.",
+        "replace": "Your RDS instance will be REPLACED — CloudFormation deletes the old one and provisions a new one. This is not a failover; it is a full replacement with downtime.",
+        "modify": "RDS instance settings updated. Most changes apply at the next maintenance window unless ApplyImmediately=true is set.",
+        "remove": "RDS instance will be DELETED. All data is permanently lost unless DeletionPolicy=Snapshot is set or you take a manual snapshot first.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "5–15 min (longer for large instances or slow storage)",
+                "loses": [
+                    "Database endpoint URL changes — update every connection string and env var",
+                    "Resource ARN changes — update any IAM policies or code referencing the old ARN",
+                    "Multi-AZ does NOT prevent this downtime — both primary and standby are replaced",
+                ],
+                "rollback": "CFN attempts to restore the original instance if the update fails; automated snapshot is taken before replacement begins",
+            },
+            "remove": {
+                "downtime": "Immediate and permanent",
+                "loses": [
+                    "All data is gone unless DeletionPolicy=Snapshot is configured",
+                    "Endpoint and ARN are released",
+                ],
+                "rollback": "Cannot be undone — manual restore from snapshot required",
+            },
+        },
     },
     "AWS::RDS::DBCluster": {
         "label": "RDS Aurora cluster",
-        "replace": "Aurora cluster will be REPLACED. All instances go down during replacement — full cluster outage.",
-        "modify": "Cluster settings updated. Impact depends on which parameters changed.",
-        "remove": "Aurora cluster will be DELETED. All data lost unless a final snapshot exists.",
+        "replace": "Aurora cluster will be REPLACED. CFN tears down all instances in the cluster and provisions a new cluster — this is a full outage, not a rolling update.",
+        "modify": "Cluster settings updated. Some changes (e.g. engine version upgrade) trigger a rolling restart; check AWS docs for the specific parameter.",
+        "remove": "Aurora cluster will be DELETED. All data and all cluster instances are permanently destroyed unless DeletionPolicy=Snapshot is set.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "10–30 min (full cluster replacement)",
+                "loses": [
+                    "Cluster endpoint URL changes",
+                    "Reader endpoint URL changes",
+                    "All cluster instances are destroyed and recreated",
+                ],
+                "rollback": "CFN attempts restore; automated snapshot taken before replacement",
+            },
+            "remove": {
+                "downtime": "Immediate and permanent",
+                "loses": ["All data unless DeletionPolicy=Snapshot", "All cluster instances"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::DynamoDB::Table": {
         "label": "DynamoDB table",
-        "replace": "DynamoDB table will be DELETED and RECREATED. ALL DATA WILL BE LOST. This is irreversible.",
-        "modify": "Table settings updated (capacity, indexes, TTL, etc.). In-place change, no data loss.",
-        "remove": "DynamoDB table will be DELETED. ALL DATA WILL BE LOST.",
+        "replace": "DynamoDB table will be DELETED and RECREATED. ALL DATA WILL BE LOST. CFN has no automatic backup mechanism for DynamoDB replacements — this is irreversible.",
+        "modify": "Table settings updated (capacity, indexes, TTL, streams, etc.). In-place change, no data loss.",
+        "remove": "DynamoDB table will be DELETED. ALL DATA WILL BE LOST unless you have point-in-time recovery or manual backups.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Table unavailable during deletion + provisioning (minutes to hours depending on size)",
+                "loses": [
+                    "ALL TABLE DATA — CFN does not back up DynamoDB before replacing",
+                    "Table ARN changes",
+                    "Any DynamoDB Streams consumers will break",
+                ],
+                "rollback": "Data loss is NOT recoverable via rollback — backup manually before deploying",
+            },
+            "remove": {
+                "downtime": "Immediate and permanent",
+                "loses": ["ALL TABLE DATA unless point-in-time recovery is enabled", "Table ARN released"],
+                "rollback": "Cannot be undone — restore from backup manually",
+            },
+        },
     },
     "AWS::S3::Bucket": {
         "label": "S3 bucket",
-        "replace": "S3 bucket will be DELETED and RECREATED. ALL OBJECTS WILL BE LOST. This is irreversible.",
-        "modify": "Bucket config updated (policy, versioning, lifecycle, etc.). No data impact.",
-        "remove": "S3 bucket will be DELETED. Objects must be empty or CloudFormation will fail.",
+        "replace": "S3 bucket will be DELETED and RECREATED. CloudFormation will fail if the bucket is not empty — you must drain it first. If deletion succeeds, ALL OBJECTS ARE GONE.",
+        "modify": "Bucket config updated (policy, versioning, lifecycle, CORS, etc.). No data impact.",
+        "remove": "S3 bucket will be DELETED. CFN requires the bucket to be empty before it can delete it.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "New bucket name may differ — all S3 URLs and presigned URLs become invalid",
+                "loses": [
+                    "ALL OBJECTS if deletion succeeds (CFN fails if bucket is not empty)",
+                    "Bucket ARN and name change",
+                    "All existing presigned URLs are invalidated",
+                    "Any replication rules pointing to/from this bucket break",
+                ],
+                "rollback": "Cannot recover deleted objects — empty the bucket safely and verify backups before proceeding",
+            },
+            "remove": {
+                "downtime": "CFN will fail if bucket is non-empty — empty it first",
+                "loses": ["Bucket and all objects (if empty at time of deletion)"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::ElastiCache::ReplicationGroup": {
         "label": "ElastiCache replication group",
-        "replace": "Cache cluster will be REPLACED. All cached data is flushed. Expect a cold cache and elevated DB load until the cache warms up.",
-        "modify": "Cache settings updated. Minor disruption possible.",
-        "remove": "Cache cluster will be DELETED. All cached data is flushed.",
+        "replace": "Cache cluster will be REPLACED. All cached data is flushed. Downstream services will hit cold cache and route all requests to the database until the cache warms up.",
+        "modify": "Cache settings updated. Some changes (e.g. node type) require a brief interruption.",
+        "remove": "Cache cluster will be DELETED. All cached data is flushed immediately.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Cache unavailable for 5–10 min during replacement + cache warm-up period",
+                "loses": [
+                    "ALL CACHED DATA — cache starts empty after replacement",
+                    "Primary endpoint URL changes if not using a CNAME in front",
+                    "Expect elevated database load until cache warms up (could be hours)",
+                ],
+                "rollback": "CFN attempts restore; cache data from old cluster is already gone",
+            },
+            "remove": {
+                "downtime": "Immediate — all cached data flushed",
+                "loses": ["All cached data", "Cache endpoint released"],
+                "rollback": "Cannot recover cached data",
+            },
+        },
     },
     "AWS::ElastiCache::CacheCluster": {
         "label": "ElastiCache cluster",
@@ -89,13 +177,30 @@ RESOURCE_KNOWLEDGE = {
         "modify": "Cache settings updated.",
         "remove": "Cache cluster deleted. All data flushed.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "Several minutes while new node provisions",
+                "loses": ["All cached data — cold cache after replacement"],
+                "rollback": "CFN attempts restore; cached data is already gone",
+            },
+        },
     },
     "AWS::ECS::Service": {
         "label": "ECS service",
-        "replace": "ECS service will be replaced. A new service is created before the old one is torn down if using a load balancer — brief disruption possible.",
-        "modify": "ECS service updated. New task definition deployed via rolling update. Downtime unlikely if you have multiple tasks.",
-        "remove": "ECS service will be stopped and deleted. All running tasks terminated.",
+        "replace": "ECS service will be replaced. With a load balancer, a new service is created before the old one is drained — brief disruption is possible during the cutover.",
+        "modify": "ECS service updated. New task definition deployed as a rolling update. If desired count > 1 and health checks pass, downtime is unlikely.",
+        "remove": "ECS service will be stopped and deleted. All running tasks are terminated immediately.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "Brief (seconds) if behind a load balancer; longer if not",
+                "loses": [
+                    "In-flight requests may be dropped during task drain",
+                    "Service ARN changes",
+                ],
+                "rollback": "CFN attempts to restore original service definition",
+            },
+        },
     },
     "AWS::ECS::TaskDefinition": {
         "label": "ECS task definition",
@@ -106,10 +211,20 @@ RESOURCE_KNOWLEDGE = {
     },
     "AWS::Lambda::Function": {
         "label": "Lambda function",
-        "replace": "Lambda function replaced. Brief unavailability possible during swap. In-flight invocations may fail.",
-        "modify": "Lambda function updated. New code/config deployed atomically. Possible brief cold-start increase.",
-        "remove": "Lambda function deleted. Any event sources pointing to it will start failing.",
+        "replace": "Lambda function replaced. The new function ARN may differ — update any event source mappings, triggers, or hardcoded ARN references pointing to this function.",
+        "modify": "Lambda function updated atomically. The new code goes live on the next invocation. In-flight executions complete against the old code.",
+        "remove": "Lambda function deleted. All event sources, triggers, and invokers pointing to it will fail immediately.",
         "risk": "LOW",
+        "detail": {
+            "replace": {
+                "downtime": "Seconds — brief unavailability during swap",
+                "loses": [
+                    "Function ARN changes if not using an alias",
+                    "In-flight invocations against the old function may fail",
+                ],
+                "rollback": "CFN restores previous function code/config",
+            },
+        },
     },
     "AWS::Lambda::EventSourceMapping": {
         "label": "Lambda event source mapping",
@@ -120,115 +235,294 @@ RESOURCE_KNOWLEDGE = {
     },
     "AWS::EC2::Instance": {
         "label": "EC2 instance",
-        "replace": "EC2 instance will be REPLACED. Old instance terminated, new one launched. Ephemeral storage and instance IP (if not Elastic) are lost. Downtime until new instance is healthy.",
-        "modify": "EC2 instance settings updated. Some changes require a stop/start cycle.",
-        "remove": "EC2 instance terminated. Ephemeral storage lost.",
+        "replace": "EC2 instance will be REPLACED. The old instance is terminated and a new one launched. The instance gets a new private IP (unless using a fixed ENI) and any ephemeral storage is lost.",
+        "modify": "EC2 instance settings updated. Some changes (e.g. instance type) require a stop/start cycle with brief downtime.",
+        "remove": "EC2 instance terminated. All ephemeral (instance store) data is lost permanently.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "5–10 min (terminate old + launch + health checks on new)",
+                "loses": [
+                    "Instance ID changes",
+                    "Private IP changes unless using a static ENI",
+                    "Public IP changes unless using an Elastic IP",
+                    "All ephemeral (instance store) data is gone",
+                    "Any in-memory state is lost",
+                ],
+                "rollback": "CFN attempts to restore original instance; ephemeral data is already gone",
+            },
+            "remove": {
+                "downtime": "Immediate",
+                "loses": ["Instance and all ephemeral storage", "Instance ID and IPs released"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::AutoScaling::AutoScalingGroup": {
         "label": "Auto Scaling Group",
-        "replace": "ASG replaced. Existing instances may be terminated and replaced.",
-        "modify": "ASG settings updated (min/max/desired, launch template, etc.).",
-        "remove": "ASG deleted. All instances in the group terminated.",
+        "replace": "ASG replaced. Existing instances are terminated and new ones launched from the new launch template/config.",
+        "modify": "ASG settings updated (min/max/desired, launch template, policies, etc.).",
+        "remove": "ASG deleted. All instances in the group are terminated.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "Depends on termination policy and health check grace period",
+                "loses": ["All existing instances replaced", "Any in-flight scaling activities cancelled"],
+                "rollback": "CFN attempts to restore original ASG",
+            },
+        },
     },
     "AWS::CloudFront::Distribution": {
         "label": "CloudFront distribution",
-        "replace": "Distribution replaced. New distribution provisioned — DNS changes needed. Old distribution deleted.",
-        "modify": "Distribution config updated. Changes propagate to all edge locations globally — can take up to 15 min.",
-        "remove": "Distribution disabled and deleted.",
+        "replace": "Distribution replaced. A new distribution is provisioned with a new domain name — you must update all DNS records and any hardcoded CloudFront URLs.",
+        "modify": "Distribution config updated. Changes propagate globally to all edge locations and can take up to 15 minutes to fully apply.",
+        "remove": "Distribution disabled then deleted. All cached content and associated DNS names become invalid.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "New distribution takes ~15 min to deploy globally; old one deleted after",
+                "loses": [
+                    "CloudFront domain name changes (e.g. abc123.cloudfront.net → xyz789.cloudfront.net)",
+                    "All DNS CNAME/ALIAS records pointing to old distribution must be updated",
+                    "SSL certificate association must be re-verified if using ACM",
+                ],
+                "rollback": "CFN restores original distribution; DNS still needs manual update",
+            },
+        },
     },
     "AWS::Route53::RecordSet": {
         "label": "Route53 DNS record",
-        "replace": "DNS record replaced. Brief DNS resolution gap possible. Propagation depends on TTL.",
-        "modify": "DNS record updated. Propagation depends on TTL.",
-        "remove": "DNS record deleted. Traffic to this hostname will fail until DNS is updated elsewhere.",
+        "replace": "DNS record replaced. There will be a brief window where the record doesn't exist — clients may get NXDOMAIN during propagation.",
+        "modify": "DNS record updated. New value propagates based on the record's TTL.",
+        "remove": "DNS record deleted. All traffic to this hostname fails until DNS is re-created elsewhere.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "Seconds to minutes depending on TTL (cached resolvers may return NXDOMAIN briefly)",
+                "loses": ["Brief DNS resolution gap during delete+recreate"],
+                "rollback": "CFN restores original record",
+            },
+            "remove": {
+                "downtime": "Immediate — all DNS resolution for this name fails",
+                "loses": ["DNS resolution for this hostname until manually recreated"],
+                "rollback": "Cannot be undone automatically",
+            },
+        },
     },
     "AWS::IAM::Role": {
         "label": "IAM role",
-        "replace": "IAM role replaced. New role gets a new ARN — any hardcoded ARN references will break. Attached policies/instances using the old role may lose permissions briefly.",
-        "modify": "IAM role updated. Permission changes take effect immediately.",
-        "remove": "IAM role deleted. Any service using this role will lose permissions immediately.",
+        "replace": "IAM role replaced. The new role gets a new ARN — any service, policy, or code that references the old ARN by value will break immediately.",
+        "modify": "IAM role updated. Permission changes (trust policy, inline policies) take effect immediately.",
+        "remove": "IAM role deleted. Any EC2 instance profile, Lambda execution role, ECS task role, or other service using this role loses all permissions immediately.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "Services using this role lose access briefly while CFN swaps it",
+                "loses": [
+                    "Role ARN changes — update all IAM policies, trust relationships, and code referencing old ARN",
+                    "Instance profiles that reference this role may need re-association",
+                ],
+                "rollback": "CFN restores original role",
+            },
+            "remove": {
+                "downtime": "Immediate — services lose permissions the moment the role is deleted",
+                "loses": ["All services using this role lose IAM permissions instantly"],
+                "rollback": "Cannot be automatically restored",
+            },
+        },
     },
     "AWS::IAM::Policy": {
         "label": "IAM policy",
-        "replace": "IAM policy replaced with a new ARN. Roles attached to the old policy lose those permissions until reattached.",
-        "modify": "IAM policy updated. Changes take effect immediately for all attached roles/users.",
-        "remove": "IAM policy deleted and detached from all principals.",
+        "replace": "IAM policy replaced with a new ARN. Any roles/users/groups attached to the old policy lose those permissions until reattached to the new one.",
+        "modify": "IAM policy updated. Permission changes are effective immediately for all attached principals.",
+        "remove": "IAM policy deleted and automatically detached from all principals.",
         "risk": "MEDIUM",
     },
     "AWS::KMS::Key": {
         "label": "KMS key",
-        "replace": "KMS key replaced. Data encrypted with the old key CANNOT be decrypted with the new key. This effectively makes encrypted data inaccessible.",
-        "modify": "KMS key settings updated (rotation, policy, etc.).",
-        "remove": "KMS key scheduled for deletion (7–30 day waiting period). Encrypted data becomes inaccessible after deletion.",
+        "replace": "KMS key replaced. Data encrypted with the old key CANNOT be decrypted with the new key — this makes all encrypted data inaccessible until re-encrypted.",
+        "modify": "KMS key settings updated (rotation schedule, key policy, description).",
+        "remove": "KMS key scheduled for deletion (7–30 day waiting period). After deletion, ALL DATA encrypted with this key becomes permanently inaccessible.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Immediate — services that decrypt data using the old key ARN will start failing",
+                "loses": [
+                    "Key ARN changes — all references must be updated",
+                    "All data encrypted with the old key cannot be decrypted without re-encrypting first",
+                    "RDS storage, S3 SSE-KMS objects, Secrets Manager secrets, EBS volumes all affected",
+                ],
+                "rollback": "Extremely dangerous — do NOT proceed without migrating encrypted data first",
+            },
+            "remove": {
+                "downtime": "7–30 day pending deletion window, then permanent",
+                "loses": ["ALL DATA encrypted with this key becomes permanently inaccessible after deletion"],
+                "rollback": "Key can be cancelled during pending-deletion window; after that, data is unrecoverable",
+            },
+        },
     },
     "AWS::SecretsManager::Secret": {
         "label": "Secrets Manager secret",
-        "replace": "Secret replaced with a new ARN. Any code referencing the old ARN will fail to retrieve the secret.",
-        "modify": "Secret value or rotation config updated.",
-        "remove": "Secret deleted (with recovery window). Applications that read this secret will fail.",
+        "replace": "Secret replaced with a new ARN. Any application or Lambda reading the secret by ARN will immediately fail to retrieve it.",
+        "modify": "Secret value or rotation config updated. Applications retrieving the secret will get the new value on next fetch.",
+        "remove": "Secret deleted (subject to recovery window). Applications reading this secret will immediately start failing.",
         "risk": "MEDIUM",
+        "detail": {
+            "replace": {
+                "downtime": "Immediate — apps break until updated to reference new ARN",
+                "loses": ["Secret ARN changes — every consumer must be updated"],
+                "rollback": "CFN restores original secret",
+            },
+        },
     },
     "AWS::SQS::Queue": {
         "label": "SQS queue",
-        "replace": "SQS queue replaced. New queue gets a new URL/ARN. In-flight and in-queue messages on the old queue are LOST.",
-        "modify": "Queue settings updated (visibility timeout, retention, etc.).",
-        "remove": "Queue deleted. All messages in the queue are LOST.",
+        "replace": "SQS queue replaced. The new queue has a new URL and ARN. All messages currently in the old queue are PERMANENTLY LOST.",
+        "modify": "Queue settings updated (visibility timeout, retention period, redrive policy, etc.).",
+        "remove": "Queue deleted. All messages in the queue are PERMANENTLY LOST.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Producers fail immediately after old queue is deleted; consumers drain and then lose remaining messages",
+                "loses": [
+                    "ALL MESSAGES in the old queue — in-flight, visible, and delayed",
+                    "Queue URL and ARN change — all producers and consumers must be updated",
+                    "Any dead-letter queue associations must be re-established",
+                ],
+                "rollback": "Messages lost before rollback are unrecoverable",
+            },
+            "remove": {
+                "downtime": "Immediate — all messages lost, producers start failing",
+                "loses": ["ALL MESSAGES in the queue", "Queue URL and ARN released"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::SNS::Topic": {
         "label": "SNS topic",
-        "replace": "SNS topic replaced. New topic gets a new ARN. All existing subscriptions are LOST — subscribers must resubscribe.",
+        "replace": "SNS topic replaced. New topic gets a new ARN. ALL EXISTING SUBSCRIPTIONS ARE LOST — every subscriber (Lambda, SQS, email, HTTP) must re-subscribe manually.",
         "modify": "Topic settings updated.",
-        "remove": "Topic deleted. All subscriptions removed. Publishers will start failing.",
+        "remove": "Topic deleted. All subscriptions are removed. Publishers pointing to this ARN will start failing.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Publishers fail after old topic is deleted; new topic is empty until subscriptions are re-added",
+                "loses": [
+                    "Topic ARN changes — all publishers must be updated",
+                    "ALL SUBSCRIPTIONS dropped — Lambda triggers, SQS subscriptions, email subscribers all removed",
+                ],
+                "rollback": "Subscriptions lost before rollback must be manually restored",
+            },
+            "remove": {
+                "downtime": "Immediate — all subscriptions dropped, publishers fail",
+                "loses": ["Topic ARN", "ALL SUBSCRIPTIONS"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::EKS::Cluster": {
         "label": "EKS Kubernetes cluster",
-        "replace": "EKS cluster REPLACED. Full cluster outage. All workloads, node groups, and addons must be rebuilt.",
-        "modify": "Cluster settings updated (version upgrade, logging, etc.). Control plane unavailable briefly during version upgrade.",
-        "remove": "EKS cluster deleted. All workloads terminated.",
+        "replace": "EKS cluster REPLACED. This is a full cluster destruction and rebuild — all workloads, node groups, add-ons, and in-cluster state are gone.",
+        "modify": "Cluster settings updated (version upgrade, logging, network config, etc.). Control plane is unavailable briefly during version upgrades.",
+        "remove": "EKS cluster deleted. All node groups, workloads, and cluster-scoped resources are terminated.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Complete cluster outage — could be 30+ min to rebuild and re-deploy workloads",
+                "loses": [
+                    "All running workloads (Deployments, StatefulSets, Jobs, etc.)",
+                    "All node groups",
+                    "All cluster add-ons (CoreDNS, kube-proxy, VPC CNI)",
+                    "Cluster endpoint URL changes",
+                    "kubeconfig becomes invalid — must be regenerated",
+                ],
+                "rollback": "Cannot automatically restore running workloads — redeploy from scratch",
+            },
+            "remove": {
+                "downtime": "Immediate and permanent",
+                "loses": ["Entire cluster and all workloads"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::MSK::Cluster": {
         "label": "MSK Kafka cluster",
-        "replace": "Kafka cluster REPLACED. All brokers replaced — topic data lost unless EBS volumes are retained separately.",
-        "modify": "Kafka cluster updated. Rolling broker restart possible.",
-        "remove": "Kafka cluster deleted. All topic data lost.",
+        "replace": "Kafka cluster REPLACED. All brokers are torn down — topic data is lost unless the EBS volumes were separately snapshotted.",
+        "modify": "Kafka cluster updated. Configuration changes may trigger a rolling broker restart.",
+        "remove": "Kafka cluster deleted. All broker storage and topic data is permanently destroyed.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "30–60 min for full cluster replacement",
+                "loses": [
+                    "ALL TOPIC DATA unless EBS volumes are separately backed up",
+                    "Bootstrap broker endpoints change — all producer/consumer configs must be updated",
+                    "Consumer group offsets are lost",
+                ],
+                "rollback": "Topic data lost before rollback is unrecoverable",
+            },
+            "remove": {
+                "downtime": "Immediate — producers and consumers fail",
+                "loses": ["All topics and all messages", "All broker storage"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::ElasticLoadBalancingV2::LoadBalancer": {
         "label": "Application/Network Load Balancer",
-        "replace": "Load balancer REPLACED. New DNS name issued — all DNS records pointing to the old ALB/NLB must be updated.",
-        "modify": "Load balancer settings updated.",
-        "remove": "Load balancer deleted. All traffic to this endpoint fails.",
+        "replace": "Load balancer REPLACED. A new DNS name is issued — every DNS record, CNAME, and Alias pointing to the old ALB/NLB must be manually updated.",
+        "modify": "Load balancer attributes updated (access logs, deletion protection, idle timeout, etc.).",
+        "remove": "Load balancer deleted. All traffic to this endpoint fails immediately.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Traffic fails until DNS is updated to the new load balancer DNS name (TTL-dependent)",
+                "loses": [
+                    "DNS name changes (e.g. old-alb-123.region.elb.amazonaws.com → new-alb-456...)",
+                    "All Route53 Alias or CNAME records must be updated",
+                    "Load balancer ARN changes — update any WAF associations or Shield protections",
+                ],
+                "rollback": "CFN restores original LB; DNS still needs manual correction",
+            },
+            "remove": {
+                "downtime": "Immediate — all traffic fails",
+                "loses": ["Load balancer DNS name released", "All listeners and rules deleted"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
     "AWS::ElasticLoadBalancingV2::TargetGroup": {
         "label": "ALB/NLB target group",
-        "replace": "Target group replaced. Listener rules referencing the old ARN must be updated.",
-        "modify": "Target group settings updated (health checks, stickiness, etc.).",
+        "replace": "Target group replaced. Listener rules referencing the old target group ARN must be updated.",
+        "modify": "Target group settings updated (health checks, stickiness, load balancing algorithm).",
         "remove": "Target group deleted.",
         "risk": "LOW",
     },
     "AWS::CloudWatch::Alarm": {
         "label": "CloudWatch alarm",
-        "replace": "Alarm replaced. Brief gap in alerting coverage.",
-        "modify": "Alarm thresholds/config updated.",
-        "remove": "Alarm deleted. Alerting for this metric stops.",
+        "replace": "Alarm replaced. Brief gap in alerting coverage while the new alarm is provisioned.",
+        "modify": "Alarm thresholds, periods, or actions updated.",
+        "remove": "Alarm deleted. Alerting on this metric/condition stops permanently.",
         "risk": "LOW",
     },
     "AWS::CloudFormation::Stack": {
         "label": "nested CloudFormation stack",
-        "replace": "Nested stack REPLACED. All resources inside the nested stack are destroyed and recreated.",
-        "modify": "Nested stack updated with new parameters or template.",
-        "remove": "Nested stack and all its resources deleted.",
+        "replace": "Nested stack REPLACED. Every resource inside the nested stack is destroyed and recreated — treat this the same as replacing the most dangerous resource in that nested stack.",
+        "modify": "Nested stack updated with new parameters or template version.",
+        "remove": "Nested stack and all resources within it are deleted.",
         "risk": "HIGH",
+        "detail": {
+            "replace": {
+                "downtime": "Depends on resources inside the nested stack",
+                "loses": ["All resources in the nested stack are destroyed and recreated"],
+                "rollback": "CFN attempts to restore the entire nested stack",
+            },
+            "remove": {
+                "downtime": "All nested stack resources deleted",
+                "loses": ["All resources inside the nested stack"],
+                "rollback": "Cannot be undone",
+            },
+        },
     },
 }
 
@@ -279,6 +573,8 @@ def parse_args():
     p.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
     p.add_argument("--no-ai", action="store_true",
                    help="Skip Claude API, use built-in explanations only")
+    p.add_argument("--strict", action="store_true",
+                   help="Exit non-zero if any replacement or removal is detected (pipeline gate)")
     return p.parse_args()
 
 # ── AWS helpers ───────────────────────────────────────────────────────────────
@@ -367,8 +663,32 @@ def describe_change_set(cfn, stack_name, change_set_name):
     return changes
 
 # ── Change explanation logic ──────────────────────────────────────────────────
+def get_replacement_causes(change):
+    """
+    Extract which specific properties force replacement and what triggered them.
+    CFN's Details[].Target.RequiresRecreation tells us which props cause recreation.
+    CausingEntity tells us the parameter/resource reference that triggered the change.
+    """
+    rc = change["ResourceChange"]
+    causes = []
+    for d in rc.get("Details", []):
+        target = d.get("Target", {})
+        recreation = target.get("RequiresRecreation", "Never")
+        if recreation in ("Always", "Conditionally"):
+            prop = target.get("Name") or target.get("Attribute", "unknown")
+            cause_source = d.get("ChangeSource", "")
+            causing_entity = d.get("CausingEntity", "")
+            causes.append({
+                "prop": prop,
+                "recreation": recreation.lower(),   # "always" or "conditionally"
+                "source": cause_source,             # e.g. "ParameterReference", "ResourceReference"
+                "caused_by": causing_entity,        # e.g. "DBInstanceType", "MyOtherResource"
+            })
+    return causes
+
+
 def explain_builtin(change):
-    """Return a plain-English explanation using the built-in knowledge base."""
+    """Return explanation, risk level, changed props, and replacement causes."""
     rc = change["ResourceChange"]
     resource_type = rc["ResourceType"]
     action = rc["Action"]
@@ -387,7 +707,7 @@ def explain_builtin(change):
         elif replacement in ("True", "Conditional"):
             explanation = knowledge["replace"]
             if replacement == "Conditional":
-                explanation += " (replacement only happens if certain properties changed — check the details below)"
+                explanation += " (replacement only happens if certain properties changed — check below)"
             risk = knowledge["risk"]
         else:
             explanation = knowledge["modify"]
@@ -407,7 +727,7 @@ def explain_builtin(change):
             explanation = f"{resource_type} will be updated in-place."
             risk = "LOW"
 
-    # List the changed properties
+    # Changed properties (all)
     details = rc.get("Details", [])
     changed_props = [
         d["Target"]["Attribute"] + (f".{d['Target'].get('Name','')}" if d["Target"].get("Name") else "")
@@ -415,7 +735,8 @@ def explain_builtin(change):
         if d.get("Target", {}).get("Attribute")
     ]
 
-    return explanation, risk, changed_props
+    replacement_causes = get_replacement_causes(change)
+    return explanation, risk, changed_props, replacement_causes
 
 def explain_with_claude(changes, stack_name):
     """Use Claude API to generate plain-English explanations for all changes."""
@@ -488,15 +809,15 @@ JSON only, no markdown, no extra text."""
 # ── Output formatting ─────────────────────────────────────────────────────────
 def overall_risk(explanations_list):
     """Derive overall risk from non-ADD changes only; adds are always safe."""
-    risks = [
-        risk for ch, _exp, risk, _props in explanations_list
+    non_add_risks = [
+        risk for ch, _exp, risk, _props, _causes in explanations_list
         if ch["ResourceChange"]["Action"] != "Add"
     ]
-    if not risks:
+    if not non_add_risks:
         return "LOW"
-    if "HIGH" in risks:
+    if "HIGH" in non_add_risks:
         return "HIGH"
-    if "MEDIUM" in risks:
+    if "MEDIUM" in non_add_risks:
         return "MEDIUM"
     return "LOW"
 
@@ -522,15 +843,85 @@ def print_header(stack_name, change_set_name, cs_type, color):
     print(row(f"  Type:       {cs_type}"))
     print(footer)
 
+def _wrap(text, indent, width=72):
+    """Word-wrap text to width, prefixing each line with indent."""
+    words = text.split()
+    line = indent
+    lines = []
+    for word in words:
+        if len(line) + len(word) + 1 > width:
+            lines.append(line.rstrip())
+            line = indent + word + " "
+        else:
+            line += word + " "
+    if line.strip():
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def _print_impact_detail(resource_type, action, replacement, replacement_causes, color):
+    """Print the verbose downtime/loses/rollback/why block for replacements and removals."""
+    knowledge = RESOURCE_KNOWLEDGE.get(resource_type, {})
+    detail_map = knowledge.get("detail", {})
+
+    # Pick the right detail sub-key
+    if action == "Remove":
+        detail = detail_map.get("remove") or detail_map.get("replace")
+    else:
+        detail = detail_map.get("replace")
+
+    has_detail = detail and (detail.get("downtime") or detail.get("loses") or detail.get("rollback"))
+    has_causes = bool(replacement_causes)
+
+    if not has_detail and not has_causes:
+        return
+
+    indent = "       "
+
+    if has_detail:
+        if detail.get("downtime"):
+            label = c(BOLD, "  DOWNTIME  ", color)
+            print(f"{label} {detail['downtime']}")
+
+        if detail.get("loses"):
+            label = c(BOLD, "  LOSES     ", color)
+            for j, item in enumerate(detail["loses"]):
+                prefix = label if j == 0 else " " * _visible_len("  LOSES     ")
+                wrapped = _wrap(item, indent + "           ", width=74)
+                first_line = wrapped.split("\n")[0].strip()
+                rest_lines = wrapped.split("\n")[1:]
+                print(f"{prefix}{c(RED if action == 'Remove' or 'LOST' in item.upper() or 'DATA' in item.upper() else YELLOW, '‣ ' + first_line, color)}")
+                for rl in rest_lines:
+                    print(f"{'':>{_visible_len(prefix) + 2}}{rl}")
+
+        if detail.get("rollback"):
+            label = c(BOLD, "  ROLLBACK  ", color)
+            print(f"{label} {_wrap(detail['rollback'], indent, width=74).split(chr(10))[0]}")
+
+    if has_causes:
+        print(f"  {c(BOLD, 'WHY REPLACED', color)}")
+        for cause in replacement_causes:
+            prop = cause["prop"]
+            recreation = cause["recreation"]
+            caused_by = cause.get("caused_by", "")
+            source = cause.get("source", "")
+
+            badge = c(RED, "always requires recreation", color) if recreation == "always" else c(YELLOW, "conditionally requires recreation", color)
+            line = f"     ‣ {c(BOLD, prop, color)} — {badge}"
+            if caused_by:
+                src_label = "parameter" if "Parameter" in source else "resource"
+                line += f"  {c(DIM, f'(triggered by {src_label}: {caused_by})', color)}"
+            print(line)
+
+
 def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, color):
     print_header(stack_name, change_set_name, cs_type, color)
 
     # Build per-change explanations
-    risks = []
     explanations = []
-    for i, ch in enumerate(changes):
+    for ch in changes:
         rc = ch["ResourceChange"]
-        builtin_exp, builtin_risk, changed_props = explain_builtin(ch)
+        builtin_exp, builtin_risk, changed_props, replacement_causes = explain_builtin(ch)
 
         # Use AI explanation if available
         if ai_explanations:
@@ -546,12 +937,12 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
         else:
             exp, risk = builtin_exp, builtin_risk
 
-        explanations.append((ch, exp, risk, changed_props))
+        explanations.append((ch, exp, risk, changed_props, replacement_causes))
 
     total_risk = overall_risk(explanations)
-    adds    = sum(1 for ch, *_ in explanations if ch["ResourceChange"]["Action"] == "Add")
-    modifies= sum(1 for ch, *_ in explanations if ch["ResourceChange"]["Action"] == "Modify")
-    removes = sum(1 for ch, *_ in explanations if ch["ResourceChange"]["Action"] == "Remove")
+    adds         = sum(1 for ch, *_ in explanations if ch["ResourceChange"]["Action"] == "Add")
+    modifies     = sum(1 for ch, *_ in explanations if ch["ResourceChange"]["Action"] == "Modify")
+    removes      = sum(1 for ch, *_ in explanations if ch["ResourceChange"]["Action"] == "Remove")
     replacements = sum(
         1 for ch, *_ in explanations
         if ch["ResourceChange"].get("Replacement") in ("True", "Conditional")
@@ -559,11 +950,10 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
 
     # Summary line
     parts = []
-    if adds:     parts.append(c(GREEN,  f"{adds} addition{'s' if adds > 1 else ''}",    color))
-    if modifies: parts.append(c(YELLOW, f"{modifies} modification{'s' if modifies > 1 else ''}", color))
-    if removes:  parts.append(c(RED,    f"{removes} removal{'s' if removes > 1 else ''}",  color))
-    if replacements:
-        parts.append(c(RED, f"{replacements} replacement{'s' if replacements > 1 else ''} ⚠", color))
+    if adds:         parts.append(c(GREEN,  f"{adds} addition{'s' if adds > 1 else ''}",    color))
+    if modifies:     parts.append(c(YELLOW, f"{modifies} modification{'s' if modifies > 1 else ''}", color))
+    if removes:      parts.append(c(RED,    f"{removes} removal{'s' if removes > 1 else ''}",  color))
+    if replacements: parts.append(c(RED,    f"{replacements} replacement{'s' if replacements > 1 else ''} ⚠", color))
 
     print()
     print(f"  {c(BOLD, 'SUMMARY', color)}: {len(changes)} change{'s' if len(changes) != 1 else ''} — {', '.join(parts)}")
@@ -571,18 +961,62 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
     risk_col = RISK_COLORS.get(total_risk, RESET)
     print(f"  {c(BOLD, 'RISK', color)}:    {c(risk_col + BOLD, total_risk, color)}", end="")
     if total_risk == "HIGH":
-        print(f"  {c(RED, '— review replacements and removals carefully', color)}", end="")
+        print(f"  {c(RED, '— one or more changes will cause downtime or data loss', color)}", end="")
     elif total_risk == "MEDIUM":
         print(f"  {c(YELLOW, '— some changes may cause brief disruption', color)}", end="")
     else:
         print(f"  {c(GREEN, '— no high-risk changes detected', color)}", end="")
     print()
 
-    # Per-change breakdown
+    # ── Attention block: surface all replacements and removals up front ──────
+    danger = [
+        (ch, exp, risk, changed_props, replacement_causes)
+        for ch, exp, risk, changed_props, replacement_causes in explanations
+        if ch["ResourceChange"]["Action"] == "Remove"
+        or ch["ResourceChange"].get("Replacement") in ("True", "Conditional")
+    ]
+
+    if danger:
+        print()
+        border_col = RED if any(
+            ch["ResourceChange"].get("Replacement") == "True" or ch["ResourceChange"]["Action"] == "Remove"
+            for ch, *_ in danger
+        ) else YELLOW
+        print(c(border_col, "  ┌─ ⚠  REQUIRES ATTENTION " + "─" * 37 + "┐", color))
+        for ch, _exp, _risk, _props, _causes in danger:
+            rc = ch["ResourceChange"]
+            action = rc["Action"]
+            replacement = rc.get("Replacement", "False")
+            logical_id  = rc["LogicalResourceId"]
+            resource_type = rc["ResourceType"]
+
+            if action == "Remove":
+                tag = c(RED + BOLD, "REMOVAL     ", color)
+            elif replacement == "True":
+                tag = c(RED + BOLD, "REPLACEMENT ", color)
+            else:
+                tag = c(YELLOW + BOLD, "COND REPLACE", color)
+
+            print(f"  {c(border_col, '│', color)}  {tag}  {c(BOLD, logical_id, color)}  {c(DIM, resource_type, color)}")
+
+            # Pull downtime from detail if available
+            knowledge = RESOURCE_KNOWLEDGE.get(resource_type, {})
+            detail_map = knowledge.get("detail", {})
+            sub = detail_map.get("remove" if action == "Remove" else "replace", {})
+            if sub.get("downtime"):
+                print(f"  {c(border_col, '│', color)}    {c(DIM, 'Downtime: ' + sub['downtime'], color)}")
+            if sub.get("loses"):
+                for item in sub["loses"][:2]:  # top 2 in the summary box
+                    short = item[:65] + "…" if len(item) > 65 else item
+                    print(f"  {c(border_col, '│', color)}    {c(RED if 'LOST' in item.upper() or 'DATA' in item.upper() or 'CANNOT' in item.upper() else DIM, '‣ ' + short, color)}")
+
+        print(c(border_col, "  └" + "─" * 62 + "┘", color))
+
+    # ── Per-change breakdown ─────────────────────────────────────────────────
     print()
     print(c(DIM, "  " + "─" * 60, color))
 
-    for i, (ch, exp, risk, changed_props) in enumerate(explanations):
+    for i, (ch, exp, risk, changed_props, replacement_causes) in enumerate(explanations):
         rc = ch["ResourceChange"]
         action = rc["Action"]
         replacement = rc.get("Replacement", "False")
@@ -600,6 +1034,8 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
             repl_badge = c(RED + BOLD, " [REPLACEMENT]", color)
         elif replacement == "Conditional":
             repl_badge = c(YELLOW + BOLD, " [CONDITIONAL REPLACEMENT]", color)
+        elif action == "Remove":
+            repl_badge = c(RED + BOLD, " [DELETION]", color)
 
         print()
         num = c(DIM, f"  {i+1}.", color)
@@ -611,20 +1047,16 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
             print(f"  {c(DIM, '→ ' + physical_id, color)}", end="")
         print()
 
-        # Wrap explanation at 70 chars
-        words = exp.split()
-        line = "     "
-        for word in words:
-            if len(line) + len(word) + 1 > 72:
-                print(line)
-                line = "     " + word + " "
-            else:
-                line += word + " "
-        if line.strip():
-            print(line)
+        # Main explanation (word-wrapped)
+        print(_wrap(exp, "     "))
 
-        # Changed properties
-        if changed_props:
+        # Verbose impact detail for replacements and removals
+        if action == "Remove" or replacement in ("True", "Conditional"):
+            print()
+            _print_impact_detail(resource_type, action, replacement, replacement_causes, color)
+
+        # In-place modifications: just show changed properties
+        elif changed_props:
             unique_props = sorted(set(p for p in changed_props if p))
             if unique_props:
                 print(f"     {c(DIM, 'Changed: ' + ', '.join(unique_props[:8]), color)}", end="")
@@ -678,14 +1110,6 @@ def delete_change_set(cfn, stack_name, change_set_name):
 def main():
     args = parse_args()
     color = supports_color() and not args.no_color
-
-    # Validate boto3
-    try:
-        import boto3
-    except ImportError:
-        print("Error: boto3 is required. Run: pip3 install boto3", file=sys.stderr)
-        sys.exit(1)
-
     cfn = get_cfn_client(args.region, args.profile)
 
     # Change set name
@@ -734,10 +1158,29 @@ def main():
     # Print the plan
     print_plan(args.stack_name, change_set_name, cs_type, changes, ai_explanations, color)
 
-    if args.no_ai and not os.environ.get("ANTHROPIC_API_KEY"):
-        pass  # built-in only, no nudge needed
-    elif not os.environ.get("ANTHROPIC_API_KEY"):
+    if not args.no_ai and not os.environ.get("ANTHROPIC_API_KEY"):
         print(c(DIM, "  Tip: set ANTHROPIC_API_KEY for AI-powered explanations\n", color))
+
+    # ── Strict mode gate ──────────────────────────────────────────────────────
+    if args.strict:
+        blockers = [
+            ch["ResourceChange"] for ch in changes
+            if ch["ResourceChange"]["Action"] == "Remove"
+            or ch["ResourceChange"].get("Replacement") in ("True", "Conditional")
+        ]
+        if blockers:
+            print(c(RED + BOLD, "  ✗  STRICT MODE: deployment blocked\n", color))
+            for rc in blockers:
+                action = rc["Action"]
+                tag = "REMOVAL" if action == "Remove" else (
+                    "REPLACEMENT" if rc.get("Replacement") == "True" else "CONDITIONAL REPLACEMENT"
+                )
+                print(c(RED, f"     {tag}: {rc['LogicalResourceId']} ({rc['ResourceType']})", color))
+            print()
+            print(c(DIM, "  Re-run without --strict to allow this deployment.\n", color))
+            if not args.describe_only:
+                delete_change_set(cfn, args.stack_name, change_set_name)
+            sys.exit(1)
 
     # Execute decision
     should_execute = args.execute
