@@ -48,11 +48,12 @@ Then reload your VSCode window (`Cmd+Shift+P` → `Reload Window`) to activate c
 
 ### cse — Change Set Explainer
 
-CloudFormation change sets are hard to read. `cse` creates a change set and rewrites the output in plain English, calling out risk levels, replacements, and data-loss scenarios before you deploy.
+CloudFormation change sets are hard to read. `cse` creates a change set and rewrites the output in plain English — with risk levels, downtime estimates, data-loss callouts, and a "why is this being replaced?" breakdown. By default it **gates on any replacement or deletion** and exits non-zero, blocking accidental destructive deploys in CI.
 
 ```sh
-cse --stack-name my-stack --template-file template.yaml
-cse --stack-name my-stack --template-file template.yaml --execute
+cse --stack-name my-stack --template-file template.yaml           # show plan, gate on replacements/deletions
+cse --stack-name my-stack --template-file template.yaml --warn-only --execute --no-interactive   # warn, don't block
+cse --stack-name my-stack --template-file template.yaml --auto-approve --execute --no-interactive # deploy regardless
 ```
 
 Set `ANTHROPIC_API_KEY` to enable AI-powered explanations via Claude.
