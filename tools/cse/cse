@@ -7,12 +7,19 @@ actually understand what's about to happen before you deploy.
 
 Usage:
     cse --stack-name my-stack --template-file template.yaml
-    cse --stack-name my-stack --template-file template.yaml --execute
+    cse --stack-name my-stack --template-file template.yaml --auto-approve
+    cse --stack-name my-stack --template-file template.yaml --auto-approve --execute
     cse --stack-name my-stack --describe-only --change-set-name my-cs
-    cse --stack-name my-stack --template-file template.yaml --no-interactive
 
-Pipeline example:
-    cse --stack-name $STACK --template-file $TEMPLATE --no-interactive --execute
+By default, cse blocks on any replacement or deletion and exits non-zero.
+Pass --auto-approve to allow the deployment to proceed (like terraform apply -auto-approve).
+
+Pipeline examples:
+    # Gate — fails the pipeline if anything would be replaced or deleted
+    cse --stack-name $STACK --template-file $TEMPLATE --no-interactive
+
+    # Auto-deploy — shows plan and executes regardless
+    cse --stack-name $STACK --template-file $TEMPLATE --auto-approve --execute --no-interactive
 
 Requires:
     pip3 install boto3
@@ -573,8 +580,8 @@ def parse_args():
     p.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
     p.add_argument("--no-ai", action="store_true",
                    help="Skip Claude API, use built-in explanations only")
-    p.add_argument("--strict", action="store_true",
-                   help="Exit non-zero if any replacement or removal is detected (pipeline gate)")
+    p.add_argument("--auto-approve", action="store_true",
+                   help="Allow deployments that contain replacements or deletions (like terraform apply -auto-approve)")
     return p.parse_args()
 
 # ── AWS helpers ───────────────────────────────────────────────────────────────
@@ -843,20 +850,73 @@ def print_header(stack_name, change_set_name, cs_type, color):
     print(row(f"  Type:       {cs_type}"))
     print(footer)
 
-def _wrap(text, indent, width=72):
-    """Word-wrap text to width, prefixing each line with indent."""
+MAX_LINE = 72  # hard wrap width for all body text
+
+def _trunc(text, n):
+    """Truncate text to n visible chars, appending ellipsis if needed."""
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+def _wrap(text, indent, width=MAX_LINE):
+    """Word-wrap text to width, prefixing each continuation line with indent."""
     words = text.split()
-    line = indent
+    cur = ""
     lines = []
     for word in words:
-        if len(line) + len(word) + 1 > width:
-            lines.append(line.rstrip())
-            line = indent + word + " "
+        if cur and len(cur) + len(word) + 1 > width:
+            lines.append(cur.rstrip())
+            cur = indent + word + " "
         else:
-            line += word + " "
-    if line.strip():
-        lines.append(line.rstrip())
+            cur = (cur or indent) + word + " "
+    if cur.strip():
+        lines.append(cur.rstrip())
     return "\n".join(lines)
+
+def _print_field(label, text, color_on, text_color=None):
+    """
+    Print a labeled field with word-wrapped text:
+        LABEL    first line of text here
+                 continuation line
+    Label column is 13 chars total (2-space indent + 9-char label + 2 spaces).
+    """
+    col = 13  # visible width of the label column
+    padded = f"  {label:<9}  "          # e.g. "  DOWNTIME  "
+    cont   = " " * col                  # continuation indent
+    words  = text.split()
+    cur    = ""
+    lines  = []
+    for word in words:
+        if cur and len(cont) + len(cur) + len(word) + 1 > MAX_LINE:
+            lines.append(cur.rstrip())
+            cur = word + " "
+        else:
+            cur = (cur + word + " ") if cur else (word + " ")
+    if cur.strip():
+        lines.append(cur.rstrip())
+    for i, line in enumerate(lines):
+        prefix = c(BOLD, padded, color_on) if i == 0 else cont
+        val    = c(text_color, line, color_on) if text_color and color_on else line
+        print(prefix + val)
+
+def _print_bullet(item, first_prefix, cont_prefix, color_on, text_color=None):
+    """Print '‣ item text' word-wrapped, with distinct first/continuation prefixes."""
+    bullet = "‣ "
+    words  = item.split()
+    cur    = ""
+    lines  = []
+    wrap_w = MAX_LINE - len(first_prefix) - len(bullet)
+    for word in words:
+        if cur and len(cur) + len(word) + 1 > wrap_w:
+            lines.append(cur.rstrip())
+            cur = word + " "
+            wrap_w = MAX_LINE - len(cont_prefix)
+        else:
+            cur = (cur + word + " ") if cur else (word + " ")
+    if cur.strip():
+        lines.append(cur.rstrip())
+    for i, line in enumerate(lines):
+        prefix = first_prefix + bullet if i == 0 else cont_prefix
+        val    = c(text_color, line, color_on) if text_color and color_on else line
+        print(prefix + val)
 
 
 def _print_impact_detail(resource_type, action, replacement, replacement_causes, color):
@@ -864,54 +924,59 @@ def _print_impact_detail(resource_type, action, replacement, replacement_causes,
     knowledge = RESOURCE_KNOWLEDGE.get(resource_type, {})
     detail_map = knowledge.get("detail", {})
 
-    # Pick the right detail sub-key
-    if action == "Remove":
-        detail = detail_map.get("remove") or detail_map.get("replace")
-    else:
-        detail = detail_map.get("replace")
-
+    detail = detail_map.get("remove" if action == "Remove" else "replace")
     has_detail = detail and (detail.get("downtime") or detail.get("loses") or detail.get("rollback"))
     has_causes = bool(replacement_causes)
 
     if not has_detail and not has_causes:
         return
 
-    indent = "       "
-
     if has_detail:
         if detail.get("downtime"):
-            label = c(BOLD, "  DOWNTIME  ", color)
-            print(f"{label} {detail['downtime']}")
+            _print_field("DOWNTIME", detail["downtime"], color)
 
         if detail.get("loses"):
-            label = c(BOLD, "  LOSES     ", color)
+            # First bullet shares row with label; subsequent bullets align under it
+            label_prefix = f"  {'LOSES':<9}  "   # 13 chars
+            cont_prefix  = " " * len(label_prefix) # 13 spaces
             for j, item in enumerate(detail["loses"]):
-                prefix = label if j == 0 else " " * _visible_len("  LOSES     ")
-                wrapped = _wrap(item, indent + "           ", width=74)
-                first_line = wrapped.split("\n")[0].strip()
-                rest_lines = wrapped.split("\n")[1:]
-                print(f"{prefix}{c(RED if action == 'Remove' or 'LOST' in item.upper() or 'DATA' in item.upper() else YELLOW, '‣ ' + first_line, color)}")
-                for rl in rest_lines:
-                    print(f"{'':>{_visible_len(prefix) + 2}}{rl}")
+                is_danger = any(kw in item.upper() for kw in
+                                ("LOST", "DATA", "CANNOT", "ALL ", "UNRECOVERABLE", "PERMANENTLY", "GONE"))
+                tc = RED if is_danger else YELLOW
+                fp = label_prefix if j == 0 else cont_prefix
+                _print_bullet(item, fp, cont_prefix + "  ", color, tc)
 
         if detail.get("rollback"):
-            label = c(BOLD, "  ROLLBACK  ", color)
-            print(f"{label} {_wrap(detail['rollback'], indent, width=74).split(chr(10))[0]}")
+            _print_field("ROLLBACK", detail["rollback"], color, DIM)
 
     if has_causes:
         print(f"  {c(BOLD, 'WHY REPLACED', color)}")
+        seen = set()
         for cause in replacement_causes:
-            prop = cause["prop"]
+            prop      = cause["prop"]
             recreation = cause["recreation"]
             caused_by = cause.get("caused_by", "")
-            source = cause.get("source", "")
+            source    = cause.get("source", "")
+            key       = (prop, caused_by)
+            if key in seen:
+                continue
+            seen.add(key)
 
-            badge = c(RED, "always requires recreation", color) if recreation == "always" else c(YELLOW, "conditionally requires recreation", color)
-            line = f"     ‣ {c(BOLD, prop, color)} — {badge}"
+            badge = c(RED, "always requires recreation", color) if recreation == "always" \
+                    else c(YELLOW, "conditionally", color)
+            src_label = "parameter" if "Parameter" in source else "resource"
+            trigger   = f"  {c(DIM, f'(triggered by {src_label}: {caused_by})', color)}" if caused_by else ""
+
+            # Check if the full line fits; if not, put trigger on next line
+            visible = f"     ‣ {prop} — {'always requires recreation' if recreation == 'always' else 'conditionally'}"
             if caused_by:
-                src_label = "parameter" if "Parameter" in source else "resource"
-                line += f"  {c(DIM, f'(triggered by {src_label}: {caused_by})', color)}"
-            print(line)
+                visible += f"  (triggered by {src_label}: {caused_by})"
+            if len(visible) > MAX_LINE:
+                print(f"     ‣ {c(BOLD, prop, color)} — {badge}")
+                if caused_by:
+                    print(f"       {c(DIM, f'triggered by {src_label}: {caused_by}', color)}")
+            else:
+                print(f"     ‣ {c(BOLD, prop, color)} — {badge}{trigger}")
 
 
 def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, color):
@@ -997,18 +1062,29 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
             else:
                 tag = c(YELLOW + BOLD, "COND REPLACE", color)
 
-            print(f"  {c(border_col, '│', color)}  {tag}  {c(BOLD, logical_id, color)}  {c(DIM, resource_type, color)}")
+            # Fit logical_id + resource_type within 60 visible chars after the tag
+            BOX_CONTENT = 58  # visible chars available after "  │  TAG  "
+            id_part   = logical_id
+            type_part = resource_type
+            avail = BOX_CONTENT - len(id_part) - 2  # 2 for the separator spaces
+            if avail < 10:
+                id_part   = _trunc(id_part, BOX_CONTENT // 2)
+                avail     = BOX_CONTENT - len(id_part) - 2
+            type_part = _trunc(type_part, max(avail, 10))
+            print(f"  {c(border_col, '│', color)}  {tag}  {c(BOLD, id_part, color)}  {c(DIM, type_part, color)}")
 
             # Pull downtime from detail if available
             knowledge = RESOURCE_KNOWLEDGE.get(resource_type, {})
             detail_map = knowledge.get("detail", {})
             sub = detail_map.get("remove" if action == "Remove" else "replace", {})
             if sub.get("downtime"):
-                print(f"  {c(border_col, '│', color)}    {c(DIM, 'Downtime: ' + sub['downtime'], color)}")
+                dt = _trunc(sub["downtime"], 55)
+                print(f"  {c(border_col, '│', color)}    {c(DIM, 'Downtime: ' + dt, color)}")
             if sub.get("loses"):
-                for item in sub["loses"][:2]:  # top 2 in the summary box
-                    short = item[:65] + "…" if len(item) > 65 else item
-                    print(f"  {c(border_col, '│', color)}    {c(RED if 'LOST' in item.upper() or 'DATA' in item.upper() or 'CANNOT' in item.upper() else DIM, '‣ ' + short, color)}")
+                for item in sub["loses"][:2]:
+                    short = _trunc(item, 55)
+                    is_d  = any(kw in item.upper() for kw in ("LOST", "DATA", "CANNOT", "ALL "))
+                    print(f"  {c(border_col, '│', color)}    {c(RED if is_d else DIM, '‣ ' + short, color)}")
 
         print(c(border_col, "  └" + "─" * 62 + "┘", color))
 
@@ -1044,7 +1120,7 @@ def print_plan(stack_name, change_set_name, cs_type, changes, ai_explanations, c
         print(f"{num} {action_str}  {c(BOLD, logical_id, color)}{repl_badge}  {risk_str}")
         print(f"     {c(DIM, resource_type, color)}", end="")
         if physical_id:
-            print(f"  {c(DIM, '→ ' + physical_id, color)}", end="")
+            print(f"  {c(DIM, '→ ' + _trunc(physical_id, 55), color)}", end="")
         print()
 
         # Main explanation (word-wrapped)
@@ -1161,15 +1237,15 @@ def main():
     if not args.no_ai and not os.environ.get("ANTHROPIC_API_KEY"):
         print(c(DIM, "  Tip: set ANTHROPIC_API_KEY for AI-powered explanations\n", color))
 
-    # ── Strict mode gate ──────────────────────────────────────────────────────
-    if args.strict:
+    # ── Default gate: block on replacements/removals unless --auto-approve ───
+    if not args.auto_approve and not args.describe_only:
         blockers = [
             ch["ResourceChange"] for ch in changes
             if ch["ResourceChange"]["Action"] == "Remove"
             or ch["ResourceChange"].get("Replacement") in ("True", "Conditional")
         ]
         if blockers:
-            print(c(RED + BOLD, "  ✗  STRICT MODE: deployment blocked\n", color))
+            print(c(RED + BOLD, "  ✗  BLOCKED: this change set contains replacements or deletions\n", color))
             for rc in blockers:
                 action = rc["Action"]
                 tag = "REMOVAL" if action == "Remove" else (
@@ -1177,9 +1253,8 @@ def main():
                 )
                 print(c(RED, f"     {tag}: {rc['LogicalResourceId']} ({rc['ResourceType']})", color))
             print()
-            print(c(DIM, "  Re-run without --strict to allow this deployment.\n", color))
-            if not args.describe_only:
-                delete_change_set(cfn, args.stack_name, change_set_name)
+            print(c(DIM, "  Review the plan above, then re-run with --auto-approve to proceed.\n", color))
+            delete_change_set(cfn, args.stack_name, change_set_name)
             sys.exit(1)
 
     # Execute decision
