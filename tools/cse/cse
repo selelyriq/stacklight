@@ -13,10 +13,14 @@ Usage:
 
 By default, cse blocks on any replacement or deletion and exits non-zero.
 Pass --auto-approve to allow the deployment to proceed (like terraform apply -auto-approve).
+Pass --warn-only to surface warnings without blocking — useful for teams building toward gating.
 
 Pipeline examples:
     # Gate — fails the pipeline if anything would be replaced or deleted
     cse --stack-name $STACK --template-file $TEMPLATE --no-interactive
+
+    # Warn only — shows plan with warnings, continues regardless (adoption ramp)
+    cse --stack-name $STACK --template-file $TEMPLATE --warn-only --execute --no-interactive
 
     # Auto-deploy — shows plan and executes regardless
     cse --stack-name $STACK --template-file $TEMPLATE --auto-approve --execute --no-interactive
@@ -582,6 +586,8 @@ def parse_args():
                    help="Skip Claude API, use built-in explanations only")
     p.add_argument("--auto-approve", action="store_true",
                    help="Allow deployments that contain replacements or deletions (like terraform apply -auto-approve)")
+    p.add_argument("--warn-only", action="store_true",
+                   help="Surface replacement/deletion warnings but do not block — useful for teams building toward pipeline gating")
     return p.parse_args()
 
 # ── AWS helpers ───────────────────────────────────────────────────────────────
@@ -1237,8 +1243,8 @@ def main():
     if not args.no_ai and not os.environ.get("ANTHROPIC_API_KEY"):
         print(c(DIM, "  Tip: set ANTHROPIC_API_KEY for AI-powered explanations\n", color))
 
-    # ── Default gate: block on replacements/removals unless --auto-approve ───
-    if not args.auto_approve and not args.describe_only:
+    # ── Default gate: block on replacements/removals unless --auto-approve/--warn-only ──
+    if not args.auto_approve and not args.warn_only and not args.describe_only:
         blockers = [
             ch["ResourceChange"] for ch in changes
             if ch["ResourceChange"]["Action"] == "Remove"
@@ -1256,6 +1262,21 @@ def main():
             print(c(DIM, "  Review the plan above, then re-run with --auto-approve to proceed.\n", color))
             delete_change_set(cfn, args.stack_name, change_set_name)
             sys.exit(1)
+    elif args.warn_only and not args.describe_only:
+        blockers = [
+            ch["ResourceChange"] for ch in changes
+            if ch["ResourceChange"]["Action"] == "Remove"
+            or ch["ResourceChange"].get("Replacement") in ("True", "Conditional")
+        ]
+        if blockers:
+            print(c(YELLOW + BOLD, "  ⚠  WARN-ONLY: replacements or deletions detected (not blocking)\n", color))
+            for rc in blockers:
+                action = rc["Action"]
+                tag = "REMOVAL" if action == "Remove" else (
+                    "REPLACEMENT" if rc.get("Replacement") == "True" else "CONDITIONAL REPLACEMENT"
+                )
+                print(c(YELLOW, f"     {tag}: {rc['LogicalResourceId']} ({rc['ResourceType']})", color))
+            print()
 
     # Execute decision
     should_execute = args.execute
