@@ -1,0 +1,21 @@
+{
+	"name": "chromaform",
+	"displayName": "ChromaForm",
+	"description": "Colors YAML keys by indentation depth for CloudFormation readability",
+	"version": "0.0.1",
+	"publisher": "local",
+	"engines": {
+		"vscode": "^1.95.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onLanguage:yaml"
+	],
+	"main": "./extension.js",
+	"contributes": {},
+	"scripts": {
+		"vscode:prepublish": "echo ok"
+	}
+}
